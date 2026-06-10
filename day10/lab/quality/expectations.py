@@ -1,7 +1,7 @@
 """
-Expectation suite đơn giản (không bắt buộc Great Expectations).
+Expectation suite don gian (khong bat buoc Great Expectations).
 
-Sinh viên có thể thay bằng GE / pydantic / custom — miễn là có halt có kiểm soát.
+Sinh vien co the thay bang GE / pydantic / custom - mien la co halt co kiem soat.
 """
 
 from __future__ import annotations
@@ -9,6 +9,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+
+REQUIRED_DOC_IDS = frozenset(
+    {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+)
 
 
 @dataclass
@@ -19,15 +29,19 @@ class ExpectationResult:
     detail: str
 
 
+def _has_repeated_sentence_burst(text: str) -> bool:
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if p.strip()]
+    return len(parts) >= 3 and len(set(parts)) == 1
+
+
 def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[ExpectationResult], bool]:
     """
-    Trả về (results, should_halt).
+    Tra ve (results, should_halt).
 
-    should_halt = True nếu có bất kỳ expectation severity halt nào fail.
+    should_halt = True neu co bat ky expectation severity halt nao fail.
     """
     results: List[ExpectationResult] = []
 
-    # E1: có ít nhất 1 dòng sau clean
     ok = len(cleaned_rows) >= 1
     results.append(
         ExpectationResult(
@@ -38,7 +52,6 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
-    # E2: không doc_id rỗng
     bad_doc = [r for r in cleaned_rows if not (r.get("doc_id") or "").strip()]
     ok2 = len(bad_doc) == 0
     results.append(
@@ -50,7 +63,6 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
-    # E3: policy refund không được chứa cửa sổ sai 14 ngày (sau khi đã fix)
     bad_refund = [
         r
         for r in cleaned_rows
@@ -67,7 +79,6 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
-    # E4: chunk_text đủ dài
     short = [r for r in cleaned_rows if len((r.get("chunk_text") or "")) < 8]
     ok4 = len(short) == 0
     results.append(
@@ -79,7 +90,6 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
-    # E5: effective_date đúng định dạng ISO sau clean (phát hiện parser lỏng)
     iso_bad = [
         r
         for r in cleaned_rows
@@ -95,7 +105,6 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
-    # E6: không còn marker phép năm cũ 10 ngày trên doc HR (conflict version sau clean)
     bad_hr_annual = [
         r
         for r in cleaned_rows
@@ -109,6 +118,29 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    present_doc_ids = {r.get("doc_id", "").strip() for r in cleaned_rows if (r.get("doc_id") or "").strip()}
+    missing_doc_ids = sorted(REQUIRED_DOC_IDS - present_doc_ids)
+    ok7 = not missing_doc_ids
+    results.append(
+        ExpectationResult(
+            "required_doc_coverage",
+            ok7,
+            "halt",
+            f"missing={missing_doc_ids}",
+        )
+    )
+
+    repeated = [r for r in cleaned_rows if _has_repeated_sentence_burst(r.get("chunk_text", ""))]
+    ok8 = len(repeated) == 0
+    results.append(
+        ExpectationResult(
+            "no_repeated_sentence_burst",
+            ok8,
+            "warn",
+            f"violations={len(repeated)}",
         )
     )
 

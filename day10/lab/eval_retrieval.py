@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-"""
-Đánh giá retrieval đơn giản — before/after khi pipeline đổi dữ liệu embed.
-
-Không bắt buộc LLM: chỉ kiểm tra top-k chunk có chứa keyword kỳ vọng hay không
-(tiếp nối tinh thần Day 08/09 nhưng tập trung data layer).
-"""
-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+from retrieval_backend import ROOT, get_query_collection
 
-ROOT = Path(__file__).resolve().parent
+load_dotenv()
 
 
 def main() -> int:
@@ -27,40 +18,22 @@ def main() -> int:
     parser.add_argument(
         "--questions",
         default=str(ROOT / "data" / "test_questions.json"),
-        help="JSON danh sách câu hỏi golden (retrieval)",
+        help="JSON danh sach cau hoi golden",
     )
     parser.add_argument(
         "--out",
         default=str(ROOT / "artifacts" / "eval" / "before_after_eval.csv"),
-        help="CSV kết quả",
+        help="CSV ket qua",
     )
     parser.add_argument("--top-k", type=int, default=3)
     args = parser.parse_args()
 
-    try:
-        import chromadb
-        from chromadb.utils import embedding_functions
-    except ImportError:
-        print("Install: pip install chromadb sentence-transformers", file=sys.stderr)
-        return 1
-
     qpath = Path(args.questions)
     if not qpath.is_file():
-        print(f"questions not found: {qpath}", file=sys.stderr)
-        return 1
+        raise SystemExit(f"questions not found: {qpath}")
 
     questions = json.loads(qpath.read_text(encoding="utf-8"))
-    db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
-    collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
-    model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-
-    client = chromadb.PersistentClient(path=db_path)
-    emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-    try:
-        col = client.get_collection(name=collection_name, embedding_function=emb)
-    except Exception as e:
-        print(f"Collection error: {e}", file=sys.stderr)
-        return 2
+    col, backend = get_query_collection()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +47,7 @@ def main() -> int:
         "hits_forbidden",
         "top1_doc_expected",
         "top_k_used",
+        "backend",
     ]
     with out_path.open("w", encoding="utf-8", newline="") as fcsv:
         w = csv.DictWriter(fcsv, fieldnames=fieldnames)
@@ -104,6 +78,7 @@ def main() -> int:
                     "hits_forbidden": "yes" if bad_forb else "no",
                     "top1_doc_expected": top1_expected,
                     "top_k_used": args.top_k,
+                    "backend": backend,
                 }
             )
 

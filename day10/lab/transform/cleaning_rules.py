@@ -1,8 +1,8 @@
 """
-Cleaning rules — raw export → cleaned rows + quarantine.
+Cleaning rules - raw export -> cleaned rows + quarantine.
 
-Baseline gồm các failure mode mở rộng (allowlist doc_id, parse ngày, HR stale version).
-Sinh viên thêm ≥3 rule mới: mỗi rule phải ghi `metric_impact` (xem README — chống trivial).
+Baseline gom cac failure mode mo rong (allowlist doc_id, parse ngay, HR stale version).
+Sinh vien them >=3 rule moi: moi rule phai ghi `metric_impact` (xem README - chong trivial).
 """
 
 from __future__ import annotations
@@ -10,25 +10,30 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-# Khớp export hợp lệ trong lab (mở rộng khi nhóm thêm doc mới — phải đồng bộ contract).
+# Khop export hop le trong lab (mo rong khi nhom them doc moi - phai dong bo contract).
 ALLOWED_DOC_IDS = frozenset(
     {
         "policy_refund_v4",
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_NOISY_PREFIX = "noi dung khong ro rang:"
 
 
 def _norm_text(s: str) -> str:
-    return " ".join((s or "").strip().split()).lower()
+    folded = unicodedata.normalize("NFKD", (s or "").strip())
+    ascii_only = folded.encode("ascii", "ignore").decode("ascii")
+    return " ".join(ascii_only.split()).lower()
 
 
 def _stable_chunk_id(doc_id: str, chunk_text: str, seq: int) -> str:
@@ -36,10 +41,15 @@ def _stable_chunk_id(doc_id: str, chunk_text: str, seq: int) -> str:
     return f"{doc_id}_{seq}_{h}"
 
 
+def _has_repeated_sentence_burst(text: str) -> bool:
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if p.strip()]
+    return len(parts) >= 3 and len(set(parts)) == 1
+
+
 def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     """
-    Trả về (iso_date, error_reason).
-    iso_date rỗng nếu không parse được.
+    Tra ve (iso_date, error_reason).
+    iso_date rong neu khong parse duoc.
     """
     s = (raw or "").strip()
     if not s:
@@ -68,15 +78,18 @@ def clean_rows(
     apply_refund_window_fix: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Trả về (cleaned, quarantine).
+    Tra ve (cleaned, quarantine).
 
-    Baseline (mở rộng theo narrative Day 10):
-    1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
-    2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
-    4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    Baseline + mo rong:
+    1) Quarantine: doc_id khong thuoc allowlist.
+    2) Chuan hoa effective_date sang YYYY-MM-DD; quarantine neu khong parse duoc.
+    3) Quarantine: HR co effective_date < 2026-01-01.
+    4) Quarantine: chunk_text rong.
+    5) Strip prefix noise "Noi dung khong ro rang:" neu co.
+    6) Quarantine: repeated sentence burst (mot cau lap lai >=3 lan).
+    7) Quarantine: HR stale text van noi "10 ngay phep nam" / "ban HR 2025".
+    8) Loai trung noi dung chunk_text (giu ban dau).
+    9) Fix stale refund: 14 -> 7 ngay lam viec.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -115,13 +128,38 @@ def clean_rows(
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
-        key = _norm_text(text)
-        if key in seen_text:
-            quarantine.append({**raw, "reason": "duplicate_chunk_text"})
-            continue
-        seen_text.add(key)
+        fixed_text = text.strip()
+        norm_fixed = _norm_text(fixed_text)
 
-        fixed_text = text
+        if norm_fixed.startswith(_NOISY_PREFIX):
+            fixed_text = fixed_text.split(":", 1)[1].strip()
+            if not fixed_text:
+                quarantine.append({**raw, "reason": "noise_only_chunk_text"})
+                continue
+            norm_fixed = _norm_text(fixed_text)
+
+        if _has_repeated_sentence_burst(fixed_text):
+            quarantine.append({**raw, "reason": "repeated_sentence_burst"})
+            continue
+
+        if doc_id == "hr_leave_policy" and (
+            "10 ngay phep nam" in norm_fixed or "ban hr 2025" in norm_fixed
+        ):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_hr_policy_text",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if key := norm_fixed:
+            if key in seen_text:
+                quarantine.append({**raw, "reason": "duplicate_chunk_text"})
+                continue
+            seen_text.add(key)
+
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
             if "14 ngày làm việc" in fixed_text:
                 fixed_text = fixed_text.replace(

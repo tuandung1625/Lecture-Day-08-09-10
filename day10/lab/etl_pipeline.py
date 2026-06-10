@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
-Lab Day 10 — ETL entrypoint: ingest → clean → validate → embed.
+Lab Day 10 - ETL entrypoint: ingest -> clean -> validate -> embed.
 
-Tiếp nối Day 09: cùng corpus docs trong data/docs/; pipeline này xử lý *export* raw (CSV)
-đại diện cho lớp ingestion từ DB/API trước khi embed lại vector store.
-
-Chạy nhanh:
-  pip install -r requirements.txt
-  cp .env.example .env
-  python etl_pipeline.py run
-
-Chế độ inject (Sprint 3 — bỏ fix refund để expectation fail / eval xấu):
-  python etl_pipeline.py run --no-refund-fix --skip-validate
+This version keeps the original flow, but falls back to the cleaned CSV snapshot
+when the local Chroma database is unavailable on the current machine.
 """
 
 from __future__ import annotations
@@ -88,15 +80,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         log("PIPELINE_HALT: expectation suite failed (halt).")
         return 2
     if halt and args.skip_validate:
-        log("WARN: expectation failed but --skip-validate → tiếp tục embed (chỉ dùng cho demo Sprint 3).")
+        log("WARN: expectation failed but --skip-validate -> continue for controlled demo use.")
 
-    # Embed
-    embed_ok = cmd_embed_internal(
+    embed_backend = cmd_embed_internal(
         cleaned_path,
         run_id=run_id,
         log=log,
     )
-    if not embed_ok:
+    if not embed_backend:
         return 3
 
     latest_exported = ""
@@ -116,6 +107,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "cleaned_csv": str(cleaned_path.relative_to(ROOT)),
         "chroma_path": os.environ.get("CHROMA_DB_PATH", "./chroma_db"),
         "chroma_collection": os.environ.get("CHROMA_COLLECTION", "day10_kb"),
+        "embed_backend": embed_backend,
     }
     man_path = MAN_DIR / f"manifest_{run_id.replace(':', '-')}.json"
     man_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -128,53 +120,56 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_embed_internal(cleaned_csv: Path, *, run_id: str, log) -> bool:
+def cmd_embed_internal(cleaned_csv: Path, *, run_id: str, log) -> str | None:
     try:
         import chromadb
         from chromadb.utils import embedding_functions
     except ImportError:
-        log("ERROR: chromadb chưa cài. pip install -r requirements.txt")
-        return False
+        log("WARN: chromadb unavailable -> publish cleaned snapshot only")
+        log(f"embed_fallback cleaned_csv={cleaned_csv.relative_to(ROOT)} backend=local_csv_fallback")
+        return "local_csv_fallback"
 
     db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
     collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
     model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-    from transform.cleaning_rules import load_raw_csv as load_csv  # same loader
-
-    rows = load_csv(cleaned_csv)
+    rows = load_raw_csv(cleaned_csv)
     if not rows:
-        log("WARN: cleaned CSV rỗng — không embed.")
-        return True
+        log("WARN: cleaned CSV empty -> skip embed.")
+        return "empty_snapshot"
 
-    client = chromadb.PersistentClient(path=db_path)
-    emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-    col = client.get_or_create_collection(name=collection_name, embedding_function=emb)
-
-    ids = [r["chunk_id"] for r in rows]
-    # Tránh “mồi cũ” trong top-k: xóa id không còn trong cleaned run này (index = snapshot publish).
     try:
-        prev = col.get(include=[])
-        prev_ids = set(prev.get("ids") or [])
-        drop = sorted(prev_ids - set(ids))
-        if drop:
-            col.delete(ids=drop)
-            log(f"embed_prune_removed={len(drop)}")
+        client = chromadb.PersistentClient(path=db_path)
+        emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+        col = client.get_or_create_collection(name=collection_name, embedding_function=emb)
+
+        ids = [r["chunk_id"] for r in rows]
+        try:
+            prev = col.get(include=[])
+            prev_ids = set(prev.get("ids") or [])
+            drop = sorted(prev_ids - set(ids))
+            if drop:
+                col.delete(ids=drop)
+                log(f"embed_prune_removed={len(drop)}")
+        except Exception as e:
+            log(f"WARN: embed prune skip: {e}")
+
+        documents = [r["chunk_text"] for r in rows]
+        metadatas = [
+            {
+                "doc_id": r.get("doc_id", ""),
+                "effective_date": r.get("effective_date", ""),
+                "run_id": run_id,
+            }
+            for r in rows
+        ]
+        col.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        log(f"embed_upsert count={len(ids)} collection={collection_name}")
+        return "chroma"
     except Exception as e:
-        log(f"WARN: embed prune skip: {e}")
-    documents = [r["chunk_text"] for r in rows]
-    metadatas = [
-        {
-            "doc_id": r.get("doc_id", ""),
-            "effective_date": r.get("effective_date", ""),
-            "run_id": run_id,
-        }
-        for r in rows
-    ]
-    # Idempotent: upsert theo chunk_id
-    col.upsert(ids=ids, documents=documents, metadatas=metadatas)
-    log(f"embed_upsert count={len(ids)} collection={collection_name}")
-    return True
+        log(f"WARN: embed backend failed -> local_csv_fallback ({e})")
+        log(f"embed_fallback cleaned_csv={cleaned_csv.relative_to(ROOT)} backend=local_csv_fallback")
+        return "local_csv_fallback"
 
 
 def cmd_freshness(args: argparse.Namespace) -> int:
@@ -192,22 +187,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Day 10 ETL pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_run = sub.add_parser("run", help="ingest → clean → validate → embed")
-    p_run.add_argument("--raw", default=str(RAW_DEFAULT), help="Đường dẫn CSV raw export")
-    p_run.add_argument("--run-id", default="", help="ID run (mặc định: UTC timestamp)")
+    p_run = sub.add_parser("run", help="ingest -> clean -> validate -> embed")
+    p_run.add_argument("--raw", default=str(RAW_DEFAULT), help="Path to raw CSV export")
+    p_run.add_argument("--run-id", default="", help="Run ID (default: UTC timestamp)")
     p_run.add_argument(
         "--no-refund-fix",
         action="store_true",
-        help="Không áp dụng rule fix cửa sổ 14→7 ngày (dùng cho inject corruption / before).",
+        help="Disable the 14->7 business-day refund fix for inject-corruption demos.",
     )
     p_run.add_argument(
         "--skip-validate",
         action="store_true",
-        help="Vẫn embed khi expectation halt (chỉ phục vụ demo có chủ đích).",
+        help="Continue publish even when halt expectations fail.",
     )
     p_run.set_defaults(func=cmd_run)
 
-    p_fr = sub.add_parser("freshness", help="Đọc manifest và kiểm tra SLA freshness")
+    p_fr = sub.add_parser("freshness", help="Read manifest and check freshness SLA")
     p_fr.add_argument("--manifest", required=True)
     p_fr.set_defaults(func=cmd_freshness)
 

@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""
-Chạy bộ câu grading (retrieval + keyword) — output JSONL cho giảng viên.
-
-  python grading_run.py --out artifacts/eval/grading_run.jsonl
-
-Yêu cầu: đã chạy `python etl_pipeline.py run` trước để có collection Chroma.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from retrieval_backend import ROOT, get_query_collection
+
 load_dotenv()
-ROOT = Path(__file__).resolve().parent
 
 
 def main() -> int:
@@ -34,22 +25,9 @@ def main() -> int:
     p.add_argument("--top-k", type=int, default=5)
     args = p.parse_args()
 
-    try:
-        import chromadb
-        from chromadb.utils import embedding_functions
-    except ImportError:
-        print("pip install chromadb sentence-transformers", file=sys.stderr)
-        return 1
-
     qpath = Path(args.questions)
     qs = json.loads(qpath.read_text(encoding="utf-8"))
-    db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
-    collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
-    model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-
-    client = chromadb.PersistentClient(path=db_path)
-    emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-    col = client.get_collection(name=collection_name, embedding_function=emb)
+    col, backend = get_query_collection()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +56,7 @@ def main() -> int:
                 "hits_forbidden": bad_forb,
                 "top1_doc_matches": top1_ok if want_top1 else None,
                 "top_k_used": args.top_k,
+                "backend": backend,
                 "grading_criteria": q.get("grading_criteria", []),
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
